@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebGL 1.0 GPU Load Test V3 (Mandelbrot Load)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+    <canvas id="gpuCanvas"></canvas>
+
+    <script>
+        // WebGL 1.0 셰이더 소스 (GLSL ES 1.00)
+
+        // 1. 정점 셰이더 (Vertex Shader)
+        const vsSource = `
+            attribute vec2 a_position;
+            varying vec2 v_texCoord;
+            
+            void main() {
+                gl_Position = vec4(a_position, 0.0, 1.0);
+                v_texCoord = (a_position * 0.5) + 0.5; // (0.0 ~ 1.0)
+            }
+        `;
+
+        // 2. 프래그먼트 셰이더 (Fragment Shader)
+        const fsSource = `
+            // 호환성 확보를 위해 mediump 사용 (부하가 highp보다 약간 낮을 수 있음)
+            precision mediump float; 
+
+            uniform float u_time;
+            uniform vec2 u_resolution;
+            varying vec2 v_texCoord;
+
+            void main() {
+                // 화면 좌표를 클립 공간과 유사한 범위로 변환합니다.
+                // 해상도를 사용하여 화면 비율을 보정합니다.
+                vec2 uv = gl_FragCoord.xy / u_resolution.xy;
+                float aspect = u_resolution.x / u_resolution.y;
+                
+                // 좌표계를 Mandelbrot 집합을 보기 좋은 영역 (-2.0 ~ 2.0)으로 변환
+                vec2 c = (uv - 0.5) * vec2(4.0 * aspect, 4.0);
+                
+                // 애니메이션 추가 (미세한 이동 및 확대/축소)
+                c.x += sin(u_time * 0.05) * 0.5;
+                c.y += cos(u_time * 0.07) * 0.5;
+
+                vec2 z = vec2(0.0);
+                float i;
+                
+                // **GPU 부하의 핵심:** 반복 횟수를 조절하여 로드 강도를 조정합니다.
+                // 100 ~ 500 사이로 변경 가능합니다.
+                int maxIterations = 200; 
+
+                // 루프를 돌며 복소수 제곱 연산을 반복합니다. (ALU에 높은 부하)
+                for (i = 0.0; i < float(maxIterations); i += 1.0) {
+                    float zx_new = z.x * z.x - z.y * z.y + c.x;
+                    z.y = 2.0 * z.x * z.y + c.y;
+                    z.x = zx_new;
+
+                    // 탈출 조건 (if문은 GPU에 분기 부하를 줍니다.)
+                    if (dot(z, z) > 4.0) break;
+                }
+                
+                // 반복 횟수를 기반으로 색상을 계산하여 시각화합니다.
+                float colorValue = i / float(maxIterations);
+                
+                // 최종 색상에 sin/cos 연산을 추가하여 부하를 유지합니다.
+                vec3 finalColor = vec3(
+                    sin(colorValue * 10.0 + u_time),
+                    cos(colorValue * 15.0),
+                    colorValue * colorValue * 1.5
+                );
+                
+                gl_FragColor = vec4(finalColor, 1.0);
+            }
+        `;
+
+        let gl;
+        let programInfo;
+        let buffers;
+        let startTime = 0;
+
+        // ------------------ WebGL 초기화 및 헬퍼 함수 ------------------
+
+        function initWebGL() {
+            const canvas = document.getElementById('gpuCanvas');
+            
+            // WebGL 1.0 컨텍스트를 가져옵니다.
+            gl = canvas.getContext('webgl', { preserveDrawingBuffer: false }) || 
+                 canvas.getContext('experimental-webgl', { preserveDrawingBuffer: false });
+
+            if (!gl) {
+                alert('🔴 웹 브라우저가 WebGL 1.0을 지원하지 않습니다. (에러: Context Failed)');
+                return;
+            }
+
+            onResize(); // 캔버스 크기 초기 설정
+            
+            const shaderProgram = initShaderProgram(gl, vsSource, fsSource);
+            if (!shaderProgram) {
+                alert('🔴 셰이더 프로그램 초기화 실패. 콘솔을 확인하십시오.');
+                return;
+            }
+            
+            programInfo = {
+                program: shaderProgram,
+                attribLocations: {
+                    position: gl.getAttribLocation(shaderProgram, 'a_position'),
+                },
+                uniformLocations: {
+                    time: gl.getUniformLocation(shaderProgram, 'u_time'),
+                    resolution: gl.getUniformLocation(shaderProgram, 'u_resolution'),
+                },
+            };
+
+            buffers = initBuffers(gl);
+            
+            window.addEventListener('resize', onResize);
+            requestAnimationFrame(render); 
+        }
+
+        // 셰이더 컴파일 및 에러 로깅
+        function loadShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                // 셰이더 컴파일 오류 발생 시 반드시 로그를 확인해야 합니다.
+                console.error('🔴 Shader Compile Error (' + (type === gl.VERTEX_SHADER ? 'VS' : 'FS') + '):', gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function initShaderProgram(gl, vsSource, fsSource) {
+            const vertexShader = loadShader(gl, gl.VERTEX_SHADER, vsSource);
+            const fragmentShader = loadShader(gl, gl.FRAGMENT_SHADER, fsSource);
+            if (!vertexShader || !fragmentShader) return null;
+
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertexShader);
+            gl.attachShader(shaderProgram, fragmentShader);
+            gl.linkProgram(shaderProgram);
+
+            if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+                console.error('🔴 Program Link Error:', gl.getProgramInfoLog(shaderProgram));
+                return null;
+            }
+            return shaderProgram;
+        }
+
+        function initBuffers(gl) {
+            const positionBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            // 화면 전체를 덮는 사각형 정점
+            const positions = [ -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0 ];
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+            return { position: positionBuffer };
+        }
+        
+        function onResize() {
+            const canvas = gl.canvas;
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gl.viewport(0, 0, canvas.width, canvas.height);
+        }
+
+        // ------------------ 렌더링 루프 ------------------
+
+        function render(now) {
+            if (!gl || !programInfo) return; // 초기화 실패 시 렌더링 중단
+            if (startTime === 0) startTime = now;
+            const timeElapsed = (now - startTime) / 1000;
+
+            gl.clearColor(0.0, 0.0, 0.0, 1.0); 
+            gl.clear(gl.COLOR_BUFFER_BIT);
+
+            gl.useProgram(programInfo.program);
+
+            // 유니폼 설정
+            gl.uniform1f(programInfo.uniformLocations.time, timeElapsed);
+            gl.uniform2f(programInfo.uniformLocations.resolution, gl.canvas.width, gl.canvas.height);
+
+            // 정점 버퍼 바인딩
+            {
+                gl.bindBuffer(gl.ARRAY_BUFFER, buffers.position);
+                gl.vertexAttribPointer(
+                    programInfo.attribLocations.position,
+                    2, // x, y
+                    gl.FLOAT,
+                    false,
+                    0,
+                    0
+                );
+                gl.enableVertexAttribArray(programInfo.attribLocations.position);
+            }
+
+            // 드로우 콜: TRIANGLE_STRIP을 사용하여 4개의 정점으로 화면을 덮습니다.
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); 
+
+            requestAnimationFrame(render);
+        }
+
+        window.onload = initWebGL;
+    </script>
+</body>
+</html>
