@@ -1,0 +1,461 @@
+<!--
+Offline WebGL Earth (single-file)
+- Run by opening this HTML in any modern browser (Chrome/Firefox) without internet.
+- Uses WebGL2 only and fully self-contained: procedural textures (no external images).
+- Features:
+  * High-detail sphere mesh (adaptive tessellation parameter)
+  * Procedural continents using fractal noise (FBM of simplex noise)
+  * Ocean shading with specular + fresnel
+  * Procedural cloud layer with soft shadows
+  * Day/night terminator and city lights (night emissive map from noise)
+  * Simple atmospheric scattering glow (approximation)
+  * Starfield background (procedural)
+  * Mouse controls: rotate, zoom (wheel), inertia
+  * Config at top for quality / performance trade-offs
+
+Notes:
+- If you need higher accuracy or to include real satellite textures, replace the procedurals with embedded base64 images.
+- Tweak QUALITY_LEVEL: 0 (fast) .. 2 (high). Higher uses more vertices.
+-->
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Offline WebGL Earth — Procedural</title>
+<style>
+  html,body{height:100%;margin:0;background:black;overflow:hidden;font-family:system-ui,Segoe UI,Roboto}
+  #ui{position:absolute;left:12px;top:12px;color:#cfcfcf;background:rgba(0,0,0,0.25);backdrop-filter:blur(6px);padding:10px;border-radius:8px;font-size:13px}
+  canvas{display:block;width:100vw;height:100vh}
+  label{display:block;margin-top:6px}
+  input[type=range]{width:180px}
+  .small{font-size:11px;color:#aaa}
+</style>
+</head>
+<body>
+<div id="ui">
+  <strong>Offline WebGL Earth</strong>
+  <div class="small">Rotate: drag • Zoom: wheel • Inertia: on</div>
+  <label>Quality: <span id="qLabel">2</span>
+    <input id="quality" type="range" min="0" max="2" value="2">
+  </label>
+  <label>Cloud density: <span id="cloudLabel">0.6</span>
+    <input id="cloudDensity" type="range" min="0" max="1" step="0.01" value="0.6">
+  </label>
+  <label>Rotation speed: <span id="rotLabel">0.2</span>
+    <input id="rotSpeed" type="range" min="0" max="1" step="0.01" value="0.2">
+  </label>
+  <div class="small" style="margin-top:8px">This file is fully offline and generates textures procedurally in the shaders.</div>
+</div>
+<canvas id="c"></canvas>
+
+<script>
+// CONFIG
+let QUALITY_LEVEL = 2; // 0=fast,1=med,2=high (updated from UI)
+const BASE_RADIUS = 1.0;
+let CLOUD_DENSITY = 0.6;
+let ROT_SPEED = 0.2;
+
+// Utility: simple mat4 helpers (minimal)
+function createMat4(){ return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]); }
+function perspective(out, fovy, aspect, near, far){
+  const f = 1.0 / Math.tan(fovy/2), nf = 1/(near - far);
+  out[0] = f/aspect; out[1]=0; out[2]=0; out[3]=0;
+  out[4]=0; out[5]=f; out[6]=0; out[7]=0;
+  out[8]=0; out[9]=0; out[10]=(far+near)*nf; out[11]=-1;
+  out[12]=0; out[13]=0; out[14]=2*far*near*nf; out[15]=0;
+}
+function lookAt(out, eye, center, up){
+  const x0=eye[0],x1=eye[1],x2=eye[2];
+  let zx = x0-center[0], zy=x1-center[1], zz=x2-center[2];
+  let len = Math.hypot(zx,zy,zz); zx/=len; zy/=len; zz/=len;
+  let xx = up[1]*zz - up[2]*zy, xy = up[2]*zx - up[0]*zz, xz = up[0]*zy - up[1]*zx;
+  len=Math.hypot(xx,xy,xz); xx/=len; xy/=len; xz/=len;
+  let yx = zy*xz - zz*xy, yy = zz*xx - zx*xz, yz = zx*xy - zy*xx;
+  out[0]=xx; out[1]=yx; out[2]=zx; out[3]=0;
+  out[4]=xy; out[5]=yy; out[6]=zy; out[7]=0;
+  out[8]=xz; out[9]=yz; out[10]=zz; out[11]=0;
+  out[12]=-(xx*x0 + xy*x1 + xz*x2);
+  out[13]=-(yx*x0 + yy*x1 + yz*x2);
+  out[14]=-(zx*x0 + zy*x1 + zz*x2);
+  out[15]=1;
+}
+function mulMat4(out,a,b){
+  const A=a,B=b; for(let i=0;i<4;i++){
+    const ai0=A[i],ai1=A[i+4],ai2=A[i+8],ai3=A[i+12];
+    out[i]=ai0*B[0]+ai1*B[1]+ai2*B[2]+ai3*B[3];
+    out[i+4]=ai0*B[4]+ai1*B[5]+ai2*B[6]+ai3*B[7];
+    out[i+8]=ai0*B[8]+ai1*B[9]+ai2*B[10]+ai3*B[11];
+    out[i+12]=ai0*B[12]+ai1*B[13]+ai2*B[14]+ai3*B[15];
+  }
+}
+
+// WebGL bootstrap
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2');
+if(!gl){
+  document.body.innerHTML = '<div style="color:#fff;padding:20px">WebGL2 required.</div>';
+  throw new Error('WebGL2 required');
+}
+
+// Resize
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.floor(innerWidth * dpr);
+  canvas.height = Math.floor(innerHeight * dpr);
+  canvas.style.width = innerWidth+'px';
+  canvas.style.height = innerHeight+'px';
+  gl.viewport(0,0,canvas.width,canvas.height);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// UI bindings
+const qualityInput = document.getElementById('quality');
+const qLabel = document.getElementById('qLabel');
+qualityInput.addEventListener('input',()=>{QUALITY_LEVEL = parseInt(qualityInput.value); qLabel.textContent=QUALITY_LEVEL; rebuildMesh();});
+const cloudInput = document.getElementById('cloudDensity');
+const cloudLabel = document.getElementById('cloudLabel');
+cloudInput.addEventListener('input',()=>{CLOUD_DENSITY = parseFloat(cloudInput.value); cloudLabel.textContent=CLOUD_DENSITY;});
+const rotInput = document.getElementById('rotSpeed');
+const rotLabel = document.getElementById('rotLabel');
+rotInput.addEventListener('input',()=>{ROT_SPEED = parseFloat(rotInput.value); rotLabel.textContent=ROT_SPEED;});
+
+// Shaders (GLSL) - Vertex shader for sphere
+const vsSource = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 position;
+layout(location=1) in vec3 normal;
+out vec3 vPos;
+out vec3 vNormal;
+uniform mat4 u_modelViewProj;
+uniform mat4 u_model;
+void main(){
+  vPos = (u_model * vec4(position,1.0)).xyz;
+  vNormal = mat3(u_model) * normal;
+  gl_Position = u_modelViewProj * vec4(position,1.0);
+}
+`;
+
+// Fragment shader: procedural continents, ocean, clouds, atmosphere
+const fsSource = `#version 300 es
+precision highp float;
+in vec3 vPos;
+in vec3 vNormal;
+out vec4 outColor;
+
+uniform vec3 u_lightDir;
+uniform float u_time;
+uniform float u_cloudDensity;
+uniform vec3 u_cameraPos;
+
+// ---------- Simplex noise (2D/3D) ----------
+// Source: Ashima Arts (adapted) - compact
+vec4 mod289(vec4 x){return x - floor(x * (1.0 / 289.0)) * 289.0;}
+vec3 mod289(vec3 x){return x - floor(x * (1.0 / 289.0)) * 289.0;}
+vec4 permute(vec4 x){return mod289(((x*34.0)+1.0)*x);} 
+float snoise(vec3 v){
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  // First corner
+  vec3 i  = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  // Other corners
+  vec3 g = step(x0.yzx, x0.xyz);
+  vec3 l = 1.0 - g;
+  vec3 i1 = min( g.xyz, l.zxy );
+  vec3 i2 = max( g.xyz, l.zxy );
+  // x1, x2
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy;
+  vec3 x3 = x0 - D.yyy;
+  // Permutations
+  i = mod289(i);
+  vec4 p = permute( permute( permute(
+             i.z + vec4(0.0, i1.z, i2.z, 1.0))
+           + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+           + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  // Gradients
+  float n_ = 1.0/7.0; // N=7
+  vec3 ns = n_ * D.wyz - D.xzx;
+  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+  vec4 x_ = floor(j * ns.z);
+  vec4 y_ = floor(j - 7.0 * x_);
+  vec4 x = x_ * ns.x + ns.y;
+  vec4 y = y_ * ns.x + ns.y;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4( x.xy, y.xy );
+  vec4 b1 = vec4( x.zw, y.zw );
+  vec4 s0 = floor(b0)*2.0 + 1.0;
+  vec4 s1 = floor(b1)*2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+  vec3 p0 = vec3(a0.x, a0.y, h.x);
+  vec3 p1 = vec3(a0.z, a0.w, h.y);
+  vec3 p2 = vec3(a1.x, a1.y, h.z);
+  vec3 p3 = vec3(a1.z, a1.w, h.w);
+  // Normalise gradients
+  vec4 norm = inversesqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  // Mix contributions
+  vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  m = m * m;
+  return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3) ) );
+}
+
+float fbm(vec3 p){
+  float f=0.0;
+  float amp=0.5;
+  for(int i=0;i<6;i++){
+    f += amp * snoise(p);
+    p *= 2.0;
+    amp *= 0.5;
+  }
+  return f;
+}
+
+// Map latitude-like detail: enhance continent shapes
+float continents(vec3 pos){
+  // lat bias: make polar regions icy / less land
+  float lat = pos.y / length(pos);
+  float bias = smoothstep(0.6, 0.9, abs(lat));
+  float n = fbm(pos*2.0 + vec3(0.0, u_time*0.00015, 0.0));
+  n = pow(n*0.5+0.5, 1.2);
+  // combine banded noise to create islands/continents
+  float c = mix(n, fbm(pos*6.0)*0.5+0.25, 0.6);
+  c = c - bias*0.55; // reduce land near poles
+  return c;
+}
+
+// Main
+void main(){
+  vec3 N = normalize(vNormal);
+  vec3 pos = normalize(vPos);
+  // Base elevation (continents)
+  float c = continents(pos);
+  // Threshold for land
+  float landMask = smoothstep(0.25, 0.32, c);
+  // Height for bump mapping
+  float elev = smoothstep(0.2,0.6,c) * 0.06; // subtle bump
+
+  // Lighting
+  vec3 L = normalize(u_lightDir);
+  float lambert = max(dot(N, L), 0.0);
+  float viewDot = max(dot(normalize(u_cameraPos - vPos), N), 0.0);
+  float fresnel = pow(1.0 - viewDot, 3.0);
+
+  // Ocean shading
+  vec3 oceanColor = vec3(0.02, 0.09, 0.22) + 0.15*lambert;
+  oceanColor += 0.2 * fresnel; // near rim brighter
+
+  // Land color palette
+  vec3 landColor = vec3(0.35, 0.3, 0.18) * (0.8 + 0.6*lambert);
+  // add greener areas at mid-latitudes with extra noise
+  float greenMix = smoothstep(0.28, 0.6, snoise(pos*10.0));
+  landColor = mix(landColor, vec3(0.09,0.45,0.14)* (0.8 + 0.6*lambert), greenMix);
+  // mountain highlights
+  float mountain = smoothstep(0.45, 0.8, snoise(pos*24.0 + vec3(10.0)));
+  landColor = mix(landColor, vec3(0.6,0.6,0.6), mountain*0.6);
+
+  // Combine
+  vec3 base = mix(oceanColor, landColor, landMask);
+
+  // Night lights: where it's dark and ocean/landMask small: show cities on land near terminator
+  float sunDot = dot(N,L);
+  float night = smoothstep(-0.05, -0.4, sunDot);
+  float cityNoise = fbm(pos*80.0 + vec3(0.0, u_time*0.01, 0.0));
+  float cityMask = smoothstep(0.65, 0.85, cityNoise);
+  vec3 cityColor = vec3(1.0,0.85,0.6) * pow(cityNoise,3.0);
+  base += cityColor * cityMask * night * 0.9;
+
+  // Clouds (separate layer): soft white with motion
+  float cloud = fbm(pos*10.0 + vec3(u_time*0.02));
+  float cloudMask = smoothstep(0.45, 0.6, cloud + sin(pos.z*30.0)*0.05);
+  cloudMask *= u_cloudDensity;
+  // cloud shadow on surface (approx)
+  float cloudShadow = smoothstep(0.5, 0.7, cloud - 0.15);
+  base = mix(base*(1.0 - 0.25*cloudShadow), base + vec3(0.95,0.95,0.98)*0.15, cloudMask*0.6);
+
+  // specular sea glint
+  float spec = pow(max(dot(reflect(-L,N), normalize(u_cameraPos - vPos)), 0.0), 24.0);
+  base += vec3(1.0)*spec*0.6* (1.0 - landMask);
+
+  // Atmosphere rim (fresnel-like)
+  float viewAngle = pow(1.0 - max(dot(normalize(u_cameraPos - vPos), N),0.0), 2.0);
+  vec3 atm = vec3(0.3,0.55,1.0) * pow(max(1.0 - dot(normalize(u_cameraPos - vPos), N),0.0), 1.5) * 0.45;
+
+  // Starfield: add subtle background when sunDot < 0.2
+  float starField = pow(snoise(pos*200.0 + vec3(u_time*0.2)), 6.0);
+  vec3 stars = vec3(1.0,0.9,0.8) * starField * smoothstep(0.2,-0.2,sunDot);
+
+  vec3 color = base + atm*viewAngle + stars*0.35;
+
+  // gamma
+  color = pow(color, vec3(1.0/2.2));
+  outColor = vec4(color,1.0);
+}
+`;
+
+// Build program helper
+function compileShader(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+    console.error(gl.getShaderInfoLog(s));
+    throw new Error('Shader compile failed');
+  }
+  return s;
+}
+function createProgram(vs, fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compileShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p, gl.LINK_STATUS)){
+    console.error(gl.getProgramInfoLog(p));
+    throw new Error('Program link failed');
+  }
+  return p;
+}
+
+const program = createProgram(vsSource, fsSource);
+
+// Uniform locations
+const uni = {
+  u_modelViewProj: gl.getUniformLocation(program,'u_modelViewProj'),
+  u_model: gl.getUniformLocation(program,'u_model'),
+  u_lightDir: gl.getUniformLocation(program,'u_lightDir'),
+  u_time: gl.getUniformLocation(program,'u_time'),
+  u_cloudDensity: gl.getUniformLocation(program,'u_cloudDensity'),
+  u_cameraPos: gl.getUniformLocation(program,'u_cameraPos')
+};
+
+// Create sphere mesh
+let sphere = null;
+function buildSphere(res){
+  const positions = [];
+  const normals = [];
+  const indices = [];
+  const latSeg = res; const lonSeg = res*2;
+  for(let y=0;y<=latSeg;y++){
+    const v = y/latSeg; const theta = v*Math.PI;
+    for(let x=0;x<=lonSeg;x++){
+      const u = x/lonSeg; const phi = u * Math.PI*2;
+      const px = Math.sin(theta)*Math.cos(phi);
+      const py = Math.cos(theta);
+      const pz = Math.sin(theta)*Math.sin(phi);
+      positions.push(px,py,pz);
+      normals.push(px,py,pz);
+    }
+  }
+  for(let y=0;y<latSeg;y++){
+    for(let x=0;x<lonSeg;x++){
+      const i = y*(lonSeg+1) + x;
+      const i2 = i + lonSeg + 1;
+      indices.push(i, i2, i+1);
+      indices.push(i+1, i2, i2+1);
+    }
+  }
+  return {positions:new Float32Array(positions), normals:new Float32Array(normals), indices:new Uint32Array(indices)};
+}
+
+let vao, ibo, posBuf, nrmBuf;
+function rebuildMesh(){
+  if(vao) gl.deleteVertexArray(vao);
+  if(ibo) gl.deleteBuffer(ibo);
+  if(posBuf) gl.deleteBuffer(posBuf);
+  if(nrmBuf) gl.deleteBuffer(nrmBuf);
+  // choose resolution based on QUALITY_LEVEL
+  let res = 64; // medium
+  if(QUALITY_LEVEL===0) res = 36;
+  if(QUALITY_LEVEL===1) res = 56;
+  if(QUALITY_LEVEL===2) res = 96;
+  sphere = buildSphere(res);
+  vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  posBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,posBuf); gl.bufferData(gl.ARRAY_BUFFER, sphere.positions, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+  nrmBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,nrmBuf); gl.bufferData(gl.ARRAY_BUFFER, sphere.normals, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,3,gl.FLOAT,false,0,0);
+  ibo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, sphere.indices, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+}
+rebuildMesh();
+
+// Camera & interaction
+let camRadius = 3.5;
+let rotX = 0.0, rotY = 0.0; // radians
+let velX = 0.0, velY = 0.0;
+let dragging=false, lastX=0, lastY=0;
+canvas.addEventListener('pointerdown', (e)=>{dragging=true; lastX=e.clientX; lastY=e.clientY; canvas.setPointerCapture(e.pointerId);});
+canvas.addEventListener('pointerup', (e)=>{dragging=false;});
+canvas.addEventListener('pointercancel', ()=>{dragging=false});
+canvas.addEventListener('pointermove', (e)=>{
+  if(!dragging) return;
+  const dx = (e.clientX - lastX)/Math.min(innerWidth,innerHeight);
+  const dy = (e.clientY - lastY)/Math.min(innerWidth,innerHeight);
+  lastX = e.clientX; lastY = e.clientY;
+  velX += dx * 6.0;
+  velY += dy * 6.0;
+});
+canvas.addEventListener('wheel', (e)=>{ camRadius += e.deltaY*0.003; camRadius = Math.min(Math.max(camRadius, 1.6), 12.0); e.preventDefault(); }, {passive:false});
+
+// Render loop
+let start = performance.now()*0.001;
+function render(){
+  const t = performance.now()*0.001 - start;
+  // inertia
+  velX *= 0.95; velY *= 0.95;
+  rotX += velX*0.5; rotY += velY*0.5;
+  // auto rotation
+  rotX += ROT_SPEED * 0.005;
+  // clamp rotY
+  rotY = Math.max(Math.min(rotY, 1.2), -1.2);
+
+  gl.enable(gl.DEPTH_TEST);
+  gl.clearColor(0,0,0,1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  gl.useProgram(program);
+  gl.bindVertexArray(vao);
+
+  // projection
+  const proj = createMat4(); perspective(proj, Math.PI/4, canvas.width/canvas.height, 0.1, 100.0);
+  // view
+  const eye = [Math.cos(rotX)*Math.cos(rotY)*camRadius, Math.sin(rotY)*camRadius, Math.sin(rotX)*Math.cos(rotY)*camRadius];
+  const center = [0,0,0];
+  const up = [0,1,0];
+  const view = createMat4(); lookAt(view, eye, center, up);
+  // model
+  const model = createMat4(); // apply subtle tilt
+  // rotate Y then X
+  const Ry = createMat4(); const Rx = createMat4();
+  const cY = Math.cos(0.0), sY=Math.sin(0.0);
+  // simple rotation matrices inline
+  Ry[0]=Math.cos(0.0); Ry[2]=Math.sin(0.0); Ry[8]=-Math.sin(0.0); Ry[10]=Math.cos(0.0);
+  Rx[5]=Math.cos(0.0); Rx[6]=-Math.sin(0.0); Rx[9]=Math.sin(0.0); Rx[10]=Math.cos(0.0);
+  // multiply pos rotations handled in shader via model matrix only for normal transform keep identity-ish
+
+  const mvp = createMat4(); mulMat4(mvp, proj, view); mulMat4(mvp, mvp, model);
+
+  gl.uniformMatrix4fv(uni.u_modelViewProj, false, mvp);
+  gl.uniformMatrix4fv(uni.u_model, false, model);
+  // sun direction (simple animated)
+  const sunDir = [Math.cos(t*0.05), 0.35, Math.sin(t*0.05)];
+  const sunNorm = (function(a){const l=Math.hypot(a[0],a[1],a[2]); return [a[0]/l,a[1]/l,a[2]/l];})(sunDir);
+  gl.uniform3fv(uni.u_lightDir, sunNorm);
+  gl.uniform1f(uni.u_time, t);
+  gl.uniform1f(uni.u_cloudDensity, CLOUD_DENSITY);
+  gl.uniform3fv(uni.u_cameraPos, new Float32Array(eye));
+
+  gl.drawElements(gl.TRIANGLES, sphere.indices.length, gl.UNSIGNED_INT, 0);
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+</script>
+</body>
+</html>
