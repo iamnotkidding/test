@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>WebGL GPU Pixel Shader Load Test</title>
+<style>
+    body { margin: 0; overflow: hidden; background-color: #111; }
+    canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="gpuCanvas"></canvas>
+
+<script>
+    const canvas = document.getElementById('gpuCanvas');
+    const gl = canvas.getContext('webgl');
+
+    if (!gl) {
+        alert('WebGL을 사용할 수 없습니다. 최신 브라우저를 확인하세요.');
+    }
+
+    // 캔버스 크기 설정 (전체 화면)
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // 1. 버텍스 셰이더 (Vertex Shader) - 간단한 사각형을 그림
+    const vsSource = `
+        attribute vec4 a_position;
+        void main() {
+            gl_Position = a_position;
+        }
+    `;
+
+    // 2. 프래그먼트 셰이더 (Fragment Shader) - 복잡한 연산 부하
+    // Mandelbrot 셋과 유사한 연산을 수행하여 부하를 높임
+    const fsSource = `
+        precision highp float;
+        uniform vec2 u_resolution;
+        uniform float u_time;
+
+        // 복잡한 연산 함수 (높은 ALU 부하)
+        vec3 complex_calc(vec2 p) {
+            vec2 z = p * 1.5;
+            vec3 color = vec3(0.0);
+            float iteration_limit = 100.0; // 반복 횟수를 높여 부하 증대
+
+            for (float i = 0.0; i < iteration_limit; i++) {
+                // z = z^2 + c (c는 p에 기반)
+                float x = (z.x * z.x - z.y * z.y) + p.x;
+                float y = (2.0 * z.x * z.y) + p.y;
+                
+                // 일부 색상 계산을 위한 연산 추가
+                color.r += cos(x * 0.1) * 0.05;
+                color.g += sin(y * 0.1) * 0.05;
+                color.b += fract(x * y * 0.01) * 0.05;
+
+                z = vec2(x, y);
+
+                // 발산 체크를 하지 않고 반복 횟수로 부하를 제어
+            }
+            return color * 0.5 + 0.5; // 색상 범위 조정
+        }
+
+        void main() {
+            vec2 uv = gl_FragCoord.xy / u_resolution.xy;
+            // 캔버스 중앙을 (0, 0)으로 맞추고 스케일 조정
+            vec2 p = (uv * 2.0 - 1.0) * 2.0; 
+
+            vec3 final_color = complex_calc(p);
+            
+            // 시간에 따라 색상 변화 (애니메이션 효과)
+            final_color.r = fract(final_color.r + u_time * 0.01);
+            final_color.g = fract(final_color.g + u_time * 0.005);
+
+            gl_FragColor = vec4(final_color, 1.0);
+        }
+    `;
+
+    // 셰이더 컴파일 및 프로그램 생성
+    function compileShader(gl, source, type) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            console.error('Shader compile error:', gl.getShaderInfoLog(shader));
+            gl.deleteShader(shader);
+            return null;
+        }
+        return shader;
+    }
+
+    const vertexShader = compileShader(gl, vsSource, gl.VERTEX_SHADER);
+    const fragmentShader = compileShader(gl, fsSource, gl.FRAGMENT_SHADER);
+
+    const program = gl.createProgram();
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error('Program link error:', gl.getProgramInfoLog(program));
+    }
+
+    gl.useProgram(program);
+
+    // 버텍스 버퍼 설정 (전체 화면을 덮는 사각형)
+    const positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    const positions = [
+        -1, -1, // 좌하단
+         1, -1, // 우하단
+        -1,  1, // 좌상단
+        -1,  1, // 좌상단
+         1, -1, // 우하단
+         1,  1, // 우상단
+    ];
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+
+    // 속성 및 유니폼 위치 찾기
+    const positionAttributeLocation = gl.getAttribLocation(program, 'a_position');
+    gl.enableVertexAttribArray(positionAttributeLocation);
+    gl.vertexAttribPointer(positionAttributeLocation, 2, gl.FLOAT, false, 0, 0);
+
+    const resolutionUniformLocation = gl.getUniformLocation(program, 'u_resolution');
+    const timeUniformLocation = gl.getUniformLocation(program, 'u_time');
+
+    let startTime = performance.now();
+
+    // 렌더링 루프
+    function drawScene(now) {
+        // 시간 업데이트
+        const time = (now - startTime) / 1000.0; 
+
+        // 유니폼 값 설정
+        gl.uniform2f(resolutionUniformLocation, canvas.width, canvas.height);
+        gl.uniform1f(timeUniformLocation, time);
+
+        // 그리기
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+        requestAnimationFrame(drawScene);
+    }
+
+    requestAnimationFrame(drawScene);
+</script>
+</body>
+</html>
